@@ -1,0 +1,6 @@
+{
+  "name": "Engine Acoustics Arch",
+  "description": "Physical modelling and DSP architecture specifications for engine audio simulation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
