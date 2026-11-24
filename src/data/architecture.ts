@@ -357,7 +357,7 @@ Establish hard limits.
     content: `
 # Development Roadmap
 
-## Phase 1: Core Physics (MVP)
+## Phase 1: Core Physics (Historical MVP)
 *   Implement EngineState, basic Thermodynamics, and Cylinder Blowdown.
 *   Implement 1D fractional Waveguide and simple Terminus radiation.
 *   Target: Generate a stable, unoptimized sound of a single cylinder popping through a straight pipe.
@@ -376,6 +376,18 @@ Establish hard limits.
 *   LOD systems, SIMD optimization, caching optimizations.
 *   Environmental convolution mixing.
 *   Automated validation framework integration.
+
+## Phases 5–8: Procedural Multi-Channel Synthesizer (\`src/components/LiveDemo.tsx\`)
+*   Implemented 4-channel \`AudioWorklet\` synthesis with dedicated Channels 2 & 3 Pops/Bangs street impulse-response convolver, turbocharger compressor whine & blow-off surge/flutter, intake filter pitch modulation, and spatial audio panning.
+
+## Phase 9: 1D Thermodynamic & Digital-Waveguide V8 (\`src/audio/phase9Engine.ts\`)
+*   Full 8-cylinder 4.58L crossplane V8 (\`1-8-4-3-6-5-7-2\`, bank cadence \`L-R-R-L-R-L-L-R\`) running at audio sample rate with zero per-sample heap allocations.
+*   Temperature-dependent specific heat $C_v(T) = 670.5 + 0.165\\,T$ with exact analytical internal-energy inversion $T(u)$, separate total cylinder mass vs. combustible fresh-charge mass tracking, Wiebe combustion ($a=5, m=2$), and Woschni convective cylinder-wall heat loss.
+*   Dual 4-into-1 Kelly-Lochbaum exhaust collectors, asymmetric L/R midpipes, H-pipe crossover waveguide, 3-path sport mufflers (perforated straight core + fiberglass-packed outer shell + quarter-wave Helmholtz side-branch), Levine-Schwinger open-pipe radiation, Lighthill high-velocity exit jet rush, and 0.52m intake snorkel waveguide + plenum/runner resonators.
+*   6-speed hydraulic torque-converter automatic transmission (Neutral, Automatic Drive \`D1–D6\`, Manual \`M1–M6\`) with ZF-style upshift torque cut and downshift throttle blip, plus a discrete 132-tooth ring-gear / 11-tooth pinion / 16-bar commutator 12V PMGR starter motor.
+
+## Phase 10: Physics & Acoustic Validation (\`tests/phase10Validation.ts\`)
+*   Browser-independent automated test suite (\`npm test\`) verifying bit-exact seed determinism, closed-cylinder 1st-Law energy conservation, valve mass/enthalpy conservation, mass-flow admittance ($Y_i = A_i / c_i$) junction scattering across temperature gradients, $C^1$-clamped \`[3/4]\` rational \`fastTanh\` accuracy ($\\max |R(x) - \\tanh(x)| = 0.0007217 < 0.00073$), and 128-sample AudioWorklet real-time block headroom.
     `,
   },
   {
@@ -395,13 +407,13 @@ Establish hard limits.
   },
   {
     id: "mvp-scope",
-    title: "15. MVP Scope",
+    title: "15. Historical Phase 1 MVP Scope vs. Current Implementation",
     content: `
-# MVP Scope
+# Historical Phase 1 MVP Scope vs. Current Implementation
 
-The Minimum Viable Product focuses purely on proving that physical combustion pulses through delay networks generates realistic engine tones.
+> **Historical Note:** The original Phase 1 MVP scope below defined the initial proof-of-concept boundary. **Phase 9 and Phase 10 supersede these historical exclusions** by implementing full 1D gas thermodynamics, dynamic temperature-dependent speed of sound $c(T)$, H-pipe crossover coupling, intake snorkel waveguides, and a 6-speed torque-converter automatic drivetrain in \`src/audio/phase9Engine.ts\`.
 
-### Included in MVP:
+### Included in Original Phase 1 MVP:
 *   **Single Engine Layout:** Naturally Aspirated V8 Crossplane.
 *   **Mechanical Model:** Fixed throttle-to-RPM mapper (no actual load/inertia physics yet).
 *   **Excitation:** Simple blowdown phenomenological pulse (pre-computed shape triggered at specific crank angles).
@@ -409,12 +421,38 @@ The Minimum Viable Product focuses purely on proving that physical combustion pu
 *   **DSP:** CPU only. Hardcoded definitions (no YAML parser).
 *   **Protection:** DC blocker and Hard Limiter applied.
 
-### Excluded from MVP:
-*   Turbochargers, Intake paths, and Airboxes.
-*   Complex thermodynamic gas equations (use approximations).
-*   Temperature-dependent propagation speed.
-*   Chassis and Cabin convolution.
-*   GPU offloading.
+### Excluded from Original Phase 1 MVP (Now Implemented in Phase 8 / Phase 9):
+*   Turbochargers (implemented in Phase 8 \`LiveDemo.tsx\`), Intake paths, and Airboxes (implemented in Phase 9 \`intakeSnorkel\` + Helmholtz/runner resonators).
+*   Complex thermodynamic gas equations (implemented in Phase 9 via exact $C_v(T)$ integration, compressible orifice flow LUTs, Wiebe heat release, and Woschni heat transfer).
+*   Temperature-dependent propagation speed (implemented in Phase 9 via per-sample $c(T) = \\sqrt{\\gamma(T) R T}$ LUT and 4-point Cubic Hermite fractional delay).
+*   Chassis and street convolution (implemented in Phase 8 4-channel convolver routing).
+
+### Status of \`/vst-boilerplate/\` (C++ / JUCE 7 Scaffold):
+*   The \`/vst-boilerplate/\` directory contains an early C++17 / JUCE 7 VST3 plugin skeleton (\`CMakeLists.txt\`, \`PluginProcessor.h/.cpp\`, \`Waveguide.h\`, \`Cylinder.h\`) with \`TODO\` placeholder stubs. It is an incomplete scaffold and is intentionally kept separate from the validated Phase 9 TypeScript engine.
+    `,
+  },
+  {
+    id: "phase10-validation",
+    title: "16. Phase 10 Physics & Acoustic Validation Reference",
+    content: `
+# Phase 10 Physics & Acoustic Validation Reference
+
+Phase 10 establishes reproducible mathematical, thermodynamic, acoustic, and real-time CPU validation for \`PhysicalEngine\` (\`src/audio/phase9Engine.ts\`) via \`npm test\` (\`tests/phase10Validation.ts\`).
+
+## 1. Mass-Flow Admittance Junction Scattering ($Y_i = A_i / c_i$)
+In \`phase9Engine.ts\`, each waveguide branch defines characteristic impedance with respect to **mass flow rate** $\\dot{m}_i = \\rho_i U_i$ $[\\text{kg/s}]$:
+$$Z_i = \\frac{c_i}{A_i} \\quad [\\text{Pa}/(\\text{kg/s})], \\qquad Y_i = \\frac{1}{Z_i} = \\frac{A_i}{c_i} \\quad [(\\text{kg/s})/\\text{Pa}]$$
+Because gas density $\\rho_i$ is already absorbed in $\\dot{m}_i = \\rho_i A_i u_i = (p_i^+ - p_i^-) / Z_i$, enforcing pressure continuity ($p_i^{\\text{in}} + p_i^{\\text{out}} = P_J$) and mass-flow conservation ($\\sum_{i=1}^N \\dot{m}_{i,\\text{into J}} = 0$) at an $N$-port junction across temperature gradients ($c_{\\text{prim}} \\neq c_{\\text{mid}} \\neq c_{\\text{tail}}$) yields:
+$$P_J = \\frac{2 \\sum_{i=1}^N Y_i\\, p_i^{\\text{in}}}{\\sum_{i=1}^N Y_i}, \\qquad p_i^{\\text{out}} = P_J - p_i^{\\text{in}}$$
+This guarantees exact mass conservation ($|\\sum \\dot{m}_i| / \\sum |\\dot{m}_i| < 10^{-15}$) and lossless wave-power conservation ($\\sum Y_i (p_i^{\\text{out}})^2 = \\sum Y_i (p_i^{\\text{in}})^2$).
+
+## 2. Exact $C^1$-Clamped \`[3/4]\` Rational \`fastTanh\` Approximant
+The legacy \`[3/2]\` Padé approximation $x(27+x^2)/(27+9x^2)$ had a maximum absolute error of **$0.023520$ at $|x| = 1.5660$**. Phase 10 replaces it with an exact $C^1$-clamped \`[3/4]\` rational approximant on $[-4.07, 4.07]$:
+$$R(x) = \\frac{x (C_0 + N_2 x^2)}{C_0 + x^2 (D_2 + x^2)}, \\quad C_0 = 163.88050423825393,\\; N_2 = 13.171696172305033,\\; D_2 = 67.41614521033179$$
+Verified across a 200,001-point grid:
+*   **Maximum absolute error:** $0.0007217 < 0.00073$ (at $|x| = 2.3487$), a **32.6x error reduction**.
+*   **Exact $C^1$ saturation:** $R(\\pm 4.07) = \\pm 1$ and $R'(\\pm 4.07) = 0$.
     `,
   }
 ];
+

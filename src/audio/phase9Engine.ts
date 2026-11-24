@@ -4,12 +4,13 @@
 // - Fresh air-fuel charge vs. residual exhaust gas tracking + Wiebe combustion + Woschni wall heat loss
 // - Per-cylinder primary exhaust runners -> 4-into-1 Kelly-Lochbaum collectors -> H-pipe ->
 //   sport expansion mufflers -> tailpipes with dynamic temperature-dependent speed of sound
-// - Passive nonlinear acoustic wave steepening (Burgers/shock effect) for authentic WOT V8 bark
+//   and mass-flow admittance (Y_i = A_i / c_i) junction scattering
+// - Passive nonlinear acoustic wave steepening (Burgers/shock approximation) for authentic WOT V8 bark
 // - Physical tailpipe exit-velocity-scaled jet flow texture (Lighthill analogy, zero idle hiss)
 // - Physical intake snorkel waveguide coupled to throttle flow + plenum AC suction pulses
-// - Cylinder-selective rotating rev limiter, realistic cranking + startup flare, ~740 RPM V8 idle
+// - Cylinder-selective rotating rev limiter, realistic cranking + startup flare, ~750 RPM V8 idle
 // - Precomputed high-resolution LUTs for compressible flow, kinematics, cam profiles, Wiebe & Woschni
-//   (runs in <5% single-core CPU @ 48 kHz with zero per-sample allocations for glitch-free AudioWorklet execution)
+//   (zero per-sample heap allocations; measured ~0.76 ms per 2.67 ms 128-sample block @ 48 kHz in Node/V8 gVisor container)
 
 export const R_GAS = 287.05;      // Specific gas constant for air/exhaust [J/(kg*K)]
 export const P_ATM = 101325.0;    // Atmospheric pressure [Pa]
@@ -18,8 +19,8 @@ export const T_WALL = 410.0;      // Mean cylinder wall temperature [K]
 
 // Temperature-dependent specific heat Cv(T) = CV_C0 + CV_C1 * T
 // 300K -> 720 J/(kg*K) (gamma=1.40), 1000K -> 835 J/(kg*K), 2500K -> 1083 J/(kg*K)
-const CV_C0 = 670.5;
-const CV_C1 = 0.165;
+export const CV_C0 = 670.5;
+export const CV_C1 = 0.165;
 const CV_C0_SQ = CV_C0 * CV_C0;
 const INV_CV_C1 = 1.0 / CV_C1;
 const TWO_CV_C1 = 2.0 * CV_C1;
@@ -27,36 +28,52 @@ const CV_C0_PLUS_R = CV_C0 + R_GAS;
 const HALF_CV_C1 = 0.5 * CV_C1;
 
 // Exact internal energy u(T) [J/kg] = integral_0^T Cv(tau) dtau
-function specificEnergyFromT(T: number): number {
+export function specificEnergyFromT(T: number): number {
   return CV_C0 * T + HALF_CV_C1 * T * T;
 }
 
 // Exact analytical inverse T(u) [K]
-function tempFromSpecificEnergy(u: number): number {
+export function tempFromSpecificEnergy(u: number): number {
   if (u <= 0.0) return 150.0;
   return (-CV_C0 + Math.sqrt(CV_C0_SQ + TWO_CV_C1 * u)) * INV_CV_C1;
 }
 
 // Exact specific enthalpy h(T) = u(T) + R * T [J/kg]
-function specificEnthalpyFromT(T: number): number {
+export function specificEnthalpyFromT(T: number): number {
   return CV_C0_PLUS_R * T + HALF_CV_C1 * T * T;
 }
 
 // Effective local gamma(T) = 1 + R / Cv(T)
-function gammaFromT(T: number): number {
+export function gammaFromT(T: number): number {
   return 1.0 + R_GAS / (CV_C0 + CV_C1 * (T > 250.0 ? T : 250.0));
 }
 
-// Fast C1-smooth Padé rational tanh approximation (max error < 0.003, zero native transcendental overhead)
-function fastTanh(x: number): number {
+// Legacy [3/2] Padé approximation retained only for Phase 10 regression comparison (max error = 0.023520 at |x| = 1.56603)
+export function legacyFastTanh(x: number): number {
   if (x >= 3.0) return 1.0;
   if (x <= -3.0) return -1.0;
   const x2 = x * x;
   return (x * (27.0 + x2)) / (27.0 + 9.0 * x2);
 }
 
+// Exact C1-clamped [3/4] rational tanh(x) approximant:
+// 1 - R(x) = (C - x)^2 * (A - D*x + x^2) / (C0 + x^2*(D2 + x^2)) for x in [0, C], with C = 4.07.
+// Satisfies R(0) = 0, R'(0) = 1, R(+-4.07) = +-1, R'(+-4.07) = 0 (exact C1 saturation),
+// strict monotonicity (R'(x) >= 0), and maximum absolute error = 0.0007217 < 0.00073 across all real x!
+const TANH_CLAMP = 4.07;
+const TANH_C0 = 163.88050423825393;
+const TANH_N2 = 13.171696172305033;
+const TANH_D2 = 67.41614521033179;
+
+export function fastTanh(x: number): number {
+  if (x >= TANH_CLAMP) return 1.0;
+  if (x <= -TANH_CLAMP) return -1.0;
+  const x2 = x * x;
+  return (x * (TANH_C0 + TANH_N2 * x2)) / (TANH_C0 + x2 * (TANH_D2 + x2));
+}
+
 // High-headroom soft saturator capped strictly below +/- 1.0 to prevent hard digital clipping
-function softLimit(v: number): number {
+export function softLimit(v: number): number {
   return 0.90 * fastTanh(v * 0.92);
 }
 
@@ -146,7 +163,7 @@ for (let i = 0; i <= C_SOUND_SIZE; i++) {
   C_SOUND_LUT[i] = Math.sqrt(gammaFromT(T) * R_GAS * T);
 }
 
-function speedOfSoundFromT(T: number): number {
+export function speedOfSoundFromT(T: number): number {
   let pos = (T - C_SOUND_MIN) * C_SOUND_SCALE;
   if (pos < 0.0) pos = 0.0;
   else if (pos > C_SOUND_SIZE - 1) pos = C_SOUND_SIZE - 1;
@@ -155,24 +172,25 @@ function speedOfSoundFromT(T: number): number {
 }
 
 // Valve timing (0 rad = Intake TDC, 2*PI = Firing TDC, 4*PI = Exhaust TDC)
-const IO_RAD = -12.0 * DEG_TO_RAD;
-const IC_RAD = 222.0 * DEG_TO_RAD;
-const EO_RAD = 496.0 * DEG_TO_RAD;
-const EC_RAD = 732.0 * DEG_TO_RAD;
+export const IO_RAD = -12.0 * DEG_TO_RAD;
+export const IC_RAD = 222.0 * DEG_TO_RAD;
+export const EO_RAD = 496.0 * DEG_TO_RAD;
+export const EC_RAD = 732.0 * DEG_TO_RAD;
 
-const MAX_INTAKE_VALVE_AREA = 0.00148;  // m^2 (4-valve DOHC effective intake curtain area)
-const MAX_EXHAUST_VALVE_AREA = 0.00118; // m^2 (4-valve DOHC effective exhaust curtain area)
+export const MAX_INTAKE_VALVE_AREA = 0.00148;  // m^2 (4-valve DOHC effective intake curtain area)
+export const MAX_EXHAUST_VALVE_AREA = 0.00118; // m^2 (4-valve DOHC effective exhaust curtain area)
 
+const U_MIN_150 = specificEnergyFromT(150.0);
 const U_MIN_220 = specificEnergyFromT(220.0);
 const U_MAX_3800 = specificEnergyFromT(3800.0);
 const U_MAX_700 = specificEnergyFromT(700.0);
 
-interface FlowResult {
+export interface FlowResult {
   dm: number;
   dE: number;
 }
 
-function calculateFlowInto(
+export function calculateFlowInto(
   Pup: number,
   Tup: number,
   Pdown: number,
@@ -239,7 +257,7 @@ function calculateFlowInto(
 
 // Smooth high-lift DOHC sport cam profile:
 // Zero velocity at seat contact (no synthetic clicks), fast blowdown opening ramp for crisp exhaust bark
-function getValveLiftNorm(angle: number, open: number, close: number): number {
+export function getValveLiftNorm(angle: number, open: number, close: number): number {
   let shifted = angle;
   if (shifted < open) shifted += FOUR_PI;
   if (shifted > close) shifted -= FOUR_PI;
@@ -257,7 +275,7 @@ function getValveLiftNorm(angle: number, open: number, close: number): number {
 // - Fractional delay supporting dynamic temperature-dependent speed of sound c(T)
 // - Optional Burgers nonlinear wave steepening (high-pressure crests travel slightly faster,
 //   creating authentic metallic V8 exhaust rasp under load with zero digital clipping)
-class WaveguideTube {
+export class WaveguideTube {
   private fwdBuf: Float32Array;
   private bwdBuf: Float32Array;
   private readonly bufSize: number;
@@ -279,8 +297,10 @@ class WaveguideTube {
   private readonly invArea: number;
   private readonly lenTimesSr: number;
   public Z: number; // Acoustic mass-flow impedance c / A [Pa / (kg/s)]
+  public Y: number; // Acoustic mass-flow admittance A / c = 1 / Z [(kg/s) / Pa]
   private baseDelay: number;
   private maxShift: number;
+  public saturationCount: number = 0;
 
   constructor(
     lengthMeters: number,
@@ -301,6 +321,7 @@ class WaveguideTube {
     this.area = Math.PI * 0.25 * diameterMeters * diameterMeters;
     this.invArea = 1.0 / this.area;
     this.Z = initialSpeedOfSound * this.invArea;
+    this.Y = this.area / initialSpeedOfSound;
     this.baseDelay = this.lenTimesSr / initialSpeedOfSound;
     // Allow authentic Burgers crest advance (up to ~7.5 samples) with strict slew-rate monotonicity
     this.maxShift = Math.min(7.5, this.baseDelay * 0.20);
@@ -317,13 +338,26 @@ class WaveguideTube {
 
   public updateSpeedOfSound(speedOfSound: number): void {
     this.Z = speedOfSound * this.invArea;
+    this.Y = this.area / speedOfSound;
     this.baseDelay = this.lenTimesSr / speedOfSound;
     this.maxShift = Math.min(7.5, this.baseDelay * 0.20);
   }
 
+  public getBaseDelay(): number {
+    return this.baseDelay;
+  }
+
+  public getLastShift(): number {
+    return this.lastShift;
+  }
+
+  public getBufferSize(): number {
+    return this.bufSize;
+  }
+
   // 4-point Cubic Hermite (Catmull-Rom) fractional delay: eliminates temperature-dependent
   // linear-interpolation HF droop across the 4 cascaded exhaust waveguide tubes!
-  private readFrac(buf: Float32Array, delaySamples: number): number {
+  public readFrac(buf: Float32Array, delaySamples: number): number {
     let d = delaySamples;
     if (d < 3.0) d = 3.0;
     else if (d > this.maxD) d = this.maxD;
@@ -377,10 +411,20 @@ class WaveguideTube {
 
     let f = this.lpFwd;
     let b = this.lpBwd;
-    if (f > 400000.0) f = 400000.0;
-    else if (f < -400000.0) f = -400000.0;
-    if (b > 400000.0) b = 400000.0;
-    else if (b < -400000.0) b = -400000.0;
+    if (f > 400000.0) {
+      f = 400000.0;
+      this.saturationCount++;
+    } else if (f < -400000.0) {
+      f = -400000.0;
+      this.saturationCount++;
+    }
+    if (b > 400000.0) {
+      b = 400000.0;
+      this.saturationCount++;
+    } else if (b < -400000.0) {
+      b = -400000.0;
+      this.saturationCount++;
+    }
 
     this.fwdBuf[this.ptr] = f;
     this.bwdBuf[this.ptr] = b;
@@ -397,12 +441,13 @@ class WaveguideTube {
     this.nlModState = 0;
     this.lastShift = 0;
     this.ptr = 0;
+    this.saturationCount = 0;
   }
 }
 
 // One bank of a V8 exhaust: 4 primary runners -> 4-into-1 collector -> midpipe ->
 // 3-path perforated-core absorption & quarter-wave side-branch resonator muffler -> tailpipe.
-class ExhaustBank {
+export class ExhaustBank {
   public primaries: WaveguideTube[];
   public midpipe: WaveguideTube;
   public mufflerCore: WaveguideTube;
@@ -430,9 +475,6 @@ class ExhaustBank {
 
   private primaryInPlus: Float64Array = new Float64Array(4);
   private stepOut = { radiatedAudio: 0.0, jetAudio: 0.0, hPipeOutgoing: 0.0 };
-  private readonly sumCollectorA: number;
-  private readonly sumMuffInA: number;
-  private readonly sumMuffOutA: number;
 
   constructor(
     runnerLengths: number[],
@@ -458,21 +500,6 @@ class ExhaustBank {
 
     // 68mm ID tailpipe
     this.tailpipe = new WaveguideTube(tailLen, 0.068, 400.0, sampleRate, 0.982, 9200.0);
-
-    this.sumCollectorA =
-      this.primaries[0].area +
-      this.primaries[1].area +
-      this.primaries[2].area +
-      this.primaries[3].area +
-      this.midpipe.area;
-    this.sumMuffInA =
-      this.mufflerCore.area +
-      this.mufflerOuter.area +
-      this.mufflerBranch.area;
-    this.sumMuffOutA =
-      this.mufflerCore.area +
-      this.mufflerOuter.area +
-      this.tailpipe.area;
 
     const dt = 1.0 / sampleRate;
     // Open tailpipe reflectance transitions around ka ~ 1 (~1.65 kHz for 68mm pipe)
@@ -526,7 +553,7 @@ class ExhaustBank {
   public step(
     cylFlows: Float64Array,
     hPipeIncoming: number,
-    hPipeArea: number,
+    hPipeY: number,
     tailGasTemp: number,
     randSigned: number
   ): { radiatedAudio: number; jetAudio: number; hPipeOutgoing: number } {
@@ -539,19 +566,23 @@ class ExhaustBank {
       this.primaryInPlus[i] = tube.pMinusOut * 0.92 + tube.Z * dm;
     }
 
-    // 2. 4-into-1 Collector Kelly-Lochbaum scattering junction
+    // 2. 4-into-1 Collector Kelly-Lochbaum scattering junction weighted by mass-flow admittance Y_i = A_i / c_i:
+    // Because mass flow into the junction from branch i is dm_i = (p_i,in - p_i,out) / Z_i = Y_i * (2 * p_i,in - P_J),
+    // exact mass conservation (sum dm_i = 0) and lossless wave-power conservation (sum Y_i * p_i,out^2 = sum Y_i * p_i,in^2)
+    // require P_J = (2 * sum Y_i * p_i,in) / sum Y_i across the primary-to-midpipe temperature gradient (c_prim != c_mid)!
     const p0 = this.primaries[0];
     const p1 = this.primaries[1];
     const p2 = this.primaries[2];
     const p3 = this.primaries[3];
-    const sumPA =
-      p0.pPlusOut * p0.area +
-      p1.pPlusOut * p1.area +
-      p2.pPlusOut * p2.area +
-      p3.pPlusOut * p3.area +
-      this.midpipe.pMinusOut * this.midpipe.area;
+    const sumCollectorY = p0.Y + p1.Y + p2.Y + p3.Y + this.midpipe.Y;
+    const sumPY =
+      p0.pPlusOut * p0.Y +
+      p1.pPlusOut * p1.Y +
+      p2.pPlusOut * p2.Y +
+      p3.pPlusOut * p3.Y +
+      this.midpipe.pMinusOut * this.midpipe.Y;
 
-    const pCollector = (2.0 * sumPA) / this.sumCollectorA;
+    const pCollector = (2.0 * sumPY) / sumCollectorY;
     this.collectorPressure = P_ATM + pCollector * 0.5;
 
     p0.writeInputs(this.primaryInPlus[0], pCollector - p0.pPlusOut);
@@ -561,15 +592,21 @@ class ExhaustBank {
     const midInPlus = pCollector - this.midpipe.pMinusOut;
 
     // 3. Midpipe -> H-pipe balance junction -> 3-path Muffler inlet (Core + Outer packing + Quarter-wave branch)
-    const sumMidMuffA = this.midpipe.area + this.sumMuffInA + hPipeArea;
+    // Weighted by mass-flow admittance Y_i = A_i / c_i across c_mid, c_tail, and 0.93 * c_tail!
+    const sumMidMuffY =
+      this.midpipe.Y +
+      this.mufflerCore.Y +
+      this.mufflerOuter.Y +
+      this.mufflerBranch.Y +
+      hPipeY;
     const pMidJunc =
       (2.0 *
-        (this.midpipe.pPlusOut * this.midpipe.area +
-          this.mufflerCore.pMinusOut * this.mufflerCore.area +
-          this.mufflerOuter.pMinusOut * this.mufflerOuter.area +
-          this.mufflerBranch.pMinusOut * this.mufflerBranch.area +
-          hPipeIncoming * hPipeArea)) /
-      sumMidMuffA;
+        (this.midpipe.pPlusOut * this.midpipe.Y +
+          this.mufflerCore.pMinusOut * this.mufflerCore.Y +
+          this.mufflerOuter.pMinusOut * this.mufflerOuter.Y +
+          this.mufflerBranch.pMinusOut * this.mufflerBranch.Y +
+          hPipeIncoming * hPipeY)) /
+      sumMidMuffY;
 
     const midInMinus = pMidJunc - this.midpipe.pPlusOut;
     const coreInPlus = pMidJunc - this.mufflerCore.pMinusOut;
@@ -581,13 +618,14 @@ class ExhaustBank {
     // Damped quarter-wave side-branch (0.65 reflection prevents sustained sub-harmonic organ-pipe hum!)
     this.mufflerBranch.writeInputs(branchInPlus, this.mufflerBranch.pPlusOut * 0.65);
 
-    // 4. Muffler exit (Perforated Core + Packed Outer Shell recombine) -> Tailpipe junction
+    // 4. Muffler exit (Perforated Core + Packed Outer Shell recombine) -> Tailpipe junction (admittance-weighted)
+    const sumMuffOutY = this.mufflerCore.Y + this.mufflerOuter.Y + this.tailpipe.Y;
     const pMuffTailJunc =
       (2.0 *
-        (this.mufflerCore.pPlusOut * this.mufflerCore.area +
-          this.mufflerOuter.pPlusOut * this.mufflerOuter.area +
-          this.tailpipe.pMinusOut * this.tailpipe.area)) /
-      this.sumMuffOutA;
+        (this.mufflerCore.pPlusOut * this.mufflerCore.Y +
+          this.mufflerOuter.pPlusOut * this.mufflerOuter.Y +
+          this.tailpipe.pMinusOut * this.tailpipe.Y)) /
+      sumMuffOutY;
 
     const coreInMinus = pMuffTailJunc - this.mufflerCore.pPlusOut;
     const outerInMinus = pMuffTailJunc - this.mufflerOuter.pPlusOut;
@@ -665,7 +703,7 @@ class ExhaustBank {
   }
 }
 
-class Cylinder {
+export class Cylinder {
   public readonly phaseOffset: number;
   public readonly bank: number;      // 0 = L, 1 = R
   public readonly bankIndex: number; // 0..3 within bank
@@ -734,14 +772,31 @@ export interface EngineStepResult {
   speedKmh: number; // Simulated vehicle speed [km/h]
 }
 
+// Phase 10 diagnostic counters distinguishing numerical recovery clamps (should be 0 in valid physics runs)
+// from expected physical actuator / control bounds (IACV limits, spark advance map bounds, and floating-point roundoff at 100% burn completion)
+export interface ClampDiagnostics {
+  // Numerical recovery / safety clamps (must remain 0 across all valid operating points):
+  nanOrInfCount: number;
+  cylMassFloorCount: number;
+  cylEnergyBoundCount: number;
+  manMassFloorCount: number;
+  manEnergyBoundCount: number;
+  manPressureCeilingCount: number;
+  waveguideSaturationCount: number;
+  // Expected physical control & roundoff bounds:
+  freshMassRoundoffClampCount: number;
+  iacvActuatorBoundCount: number;
+  sparkAdvanceBoundCount: number;
+}
+
 const ANGLE_LUT_SIZE = 1024;
 const ANGLE_LUT_MASK = ANGLE_LUT_SIZE - 1;
 const ANGLE_TO_LUT = ANGLE_LUT_SIZE * INV_FOUR_PI;
 
 // 6-speed sport automatic transmission ratios (ZF 6HP / 8HP style close-ratio V8 steps) + 3.42 final drive
-const AT_GEAR_RATIOS = [0.0, 4.17, 2.34, 1.52, 1.14, 0.87, 0.69];
-const AT_FINAL_DRIVE = 3.42;
-const AT_WHEEL_RADIUS = 0.335; // 275/35 R19 rear tire rolling radius [m]
+export const AT_GEAR_RATIOS = [0.0, 4.17, 2.34, 1.52, 1.14, 0.87, 0.69];
+export const AT_FINAL_DRIVE = 3.42;
+export const AT_WHEEL_RADIUS = 0.335; // 275/35 R19 rear tire rolling radius [m]
 
 export class PhysicalEngine {
   public readonly sampleRate: number;
@@ -812,6 +867,7 @@ export class PhysicalEngine {
   // Precomputed per-sample control alphas (eliminates Math.exp per sample)
   private readonly ctrlAlpha: number;
   private readonly tipInAlpha: number;
+  private readonly shiftAlpha: number;
   private readonly shiftCutAlpha: number;
   private readonly burbleAttackAlpha: number;
   private readonly mechContactAlpha: number;
@@ -837,22 +893,38 @@ export class PhysicalEngine {
   private blockX1 = 0; private blockX2 = 0;
   private blockY1 = 0; private blockY2 = 0;
 
-  // Physical DC starter motor: bendix engagement clunk + planetary/ring-gear tooth-contact impulses + commutator brush chuff
-  private starterPhase: number = 0.0;
+  // Physical 12V PMGR DC starter motor (ZERO sine oscillators, ZERO resonant bandpass filter!):
+  // Discrete flywheel ring-gear/pinion spur-tooth impacts + 16-bar copper commutator & planetary gear whir + solenoid clack + armature spin-down
+  private readonly ringToothProfile: Float32Array;
+  private readonly pinionToothProfile: Float32Array;
+  private readonly commBarProfile: Float32Array;
+  private starterArmatureOmega: number = 0.0;
+  private starterRingPos: number = 0.0;
+  private starterRingLastIdx: number = 0;
+  private starterCommPos: number = 0.0;
+  private starterCommLastIdx: number = 0;
+  private starterToothPulse: number = 0.0;
+  private starterToothRebound: number = 0.0;
+  private starterToothLp: number = 0.0;
+  private starterCommPulse: number = 0.0;
+  private starterCommLp: number = 0.0;
+  private starterSolenoidEnv: number = 0.0;
   private starterEnv: number = 0.0;
-  private starterLp: number = 0.0;
-  private starterResX1: number = 0.0;
-  private starterResX2: number = 0.0;
-  private starterResY1: number = 0.0;
-  private starterResY2: number = 0.0;
-  private starterResB0: number = 0.0;
-  private starterResB2: number = 0.0;
-  private starterResA1: number = 0.0;
-  private starterResA2: number = 0.0;
+  private starterHpX1: number = 0.0;
+  private starterHpY1: number = 0.0;
+  private starterAirLp: number = 0.0;
   private prevStarterEngaged: boolean = false;
   private readonly starterAttackAlpha: number;
   private readonly starterReleaseAlpha: number;
-  private readonly starterLpAlpha: number;
+  private readonly starterArmAlpha: number;
+  private readonly starterToothDecay: number;
+  private readonly starterReboundDecay: number;
+  private readonly starterToothLpAlpha: number;
+  private readonly starterCommDecay: number;
+  private readonly starterCommLpAlpha: number;
+  private readonly starterSolenoidDecay: number;
+  private readonly starterHpR: number;
+  private readonly starterAirLpAlpha: number;
 
   // Smooth control, cold-crank ECU sync, startup flare, & rotating rev limiter states
   private idleIntegral: number = 0.0;
@@ -887,7 +959,7 @@ export class PhysicalEngine {
   private inFlow: FlowResult = { dm: 0, dE: 0 };
   private exFlow: FlowResult = { dm: 0, dE: 0 };
 
-  private result: EngineStepResult = {
+  public result: EngineStepResult = {
     exhaustAudioL: 0,
     exhaustAudioR: 0,
     intakeAudio: 0,
@@ -905,12 +977,27 @@ export class PhysicalEngine {
   };
 
   private rngState: number = 0x12345678;
+  private initialSeed: number = 0x12345678;
 
-  constructor(sampleRate: number) {
+  public readonly clampStats: ClampDiagnostics = {
+    nanOrInfCount: 0,
+    cylMassFloorCount: 0,
+    cylEnergyBoundCount: 0,
+    manMassFloorCount: 0,
+    manEnergyBoundCount: 0,
+    manPressureCeilingCount: 0,
+    waveguideSaturationCount: 0,
+    freshMassRoundoffClampCount: 0,
+    iacvActuatorBoundCount: 0,
+    sparkAdvanceBoundCount: 0,
+  };
+
+  constructor(sampleRate: number, seed: number = 0x12345678) {
     this.sampleRate = sampleRate;
     this.dt = 1.0 / sampleRate;
     this.invInertia = 1.0 / this.inertia;
     this.invManV = 1.0 / this.man_V;
+    this.setSeed(seed);
 
     this.r = this.stroke * 0.5;
     this.pistonArea = Math.PI * 0.25 * this.bore * this.bore;
@@ -946,9 +1033,10 @@ export class PhysicalEngine {
       this.lutAreaEx[k] = getValveLiftNorm(angle, EO_RAD, EC_RAD) * MAX_EXHAUST_VALVE_AREA;
     }
 
-    // Control & filter constants
+    // Control & filter constants (all precomputed at init -> zero runtime Math.exp in step()!)
     this.ctrlAlpha = 1.0 - Math.exp(-this.dt / 0.015);
     this.tipInAlpha = 1.0 - Math.exp(-this.dt / 0.009);
+    this.shiftAlpha = 1.0 - Math.exp(-this.dt / 0.032);
     this.shiftCutAlpha = 1.0 - Math.exp(-this.dt / 0.006);
     this.burbleAttackAlpha = 1.0 - Math.exp(-this.dt / 0.0018);
     this.mechContactAlpha = 1.0 - Math.exp(-this.dt / 0.00038);
@@ -958,18 +1046,34 @@ export class PhysicalEngine {
     // ~18 Hz slow plenum mean tracker for extracting AC suction pulses
     this.manPMeanAlpha = 1.0 - Math.exp((-TWO_PI * 18.0) / sampleRate);
 
-    // Physical starter bendix engagement/release smoothing & starter housing resonance (fc = 920 Hz, damped Q = 1.35)
-    this.starterAttackAlpha = 1.0 - Math.exp(-this.dt / 0.012);
-    this.starterReleaseAlpha = 1.0 - Math.exp(-this.dt / 0.030);
-    const rcStarter = 1.0 / (TWO_PI * 1650.0);
-    this.starterLpAlpha = this.dt / (rcStarter + this.dt);
-    const wSt = (TWO_PI * 920.0) / sampleRate;
-    const alphaSt = Math.sin(wSt) / (2.0 * 1.35);
-    const a0St = 1.0 + alphaSt;
-    this.starterResB0 = alphaSt / a0St;
-    this.starterResB2 = -alphaSt / a0St;
-    this.starterResA1 = (-2.0 * Math.cos(wSt)) / a0St;
-    this.starterResA2 = (1.0 - alphaSt) / a0St;
+    // Physical 12V PMGR starter deterministic gear-tooth & commutator-bar machining profiles (zero runtime allocations)
+    this.ringToothProfile = new Float32Array(132);
+    for (let i = 0; i < 132; i++) {
+      const runout = 1.0 + 0.12 * Math.cos((TWO_PI * i) / 132.0);
+      const microVar = 1.0 + 0.24 * this.nextRandSigned();
+      this.ringToothProfile[i] = runout * microVar;
+    }
+    this.pinionToothProfile = new Float32Array(11);
+    for (let i = 0; i < 11; i++) {
+      this.pinionToothProfile[i] = 1.0 + 0.18 * this.nextRandSigned();
+    }
+    this.commBarProfile = new Float32Array(16);
+    for (let i = 0; i < 16; i++) {
+      this.commBarProfile[i] = 1.0 + 0.22 * this.nextRandSigned();
+    }
+
+    // Non-resonant 1-pole impulse shapers for crisp steel gear-tooth impacts & high-speed commutator whir
+    this.starterAttackAlpha = 1.0 - Math.exp(-this.dt / 0.008);
+    this.starterReleaseAlpha = 1.0 - Math.exp(-this.dt / 0.028);
+    this.starterArmAlpha = 1.0 - Math.exp(-this.dt / 0.010);
+    this.starterToothDecay = Math.exp(-this.dt / 0.00028);
+    this.starterReboundDecay = Math.exp(-this.dt / 0.00068);
+    this.starterToothLpAlpha = 1.0 - Math.exp(-this.dt / 0.00011);
+    this.starterCommDecay = Math.exp(-this.dt / 0.00014);
+    this.starterCommLpAlpha = 1.0 - Math.exp(-this.dt / 0.00006);
+    this.starterSolenoidDecay = Math.exp(-this.dt / 0.0075);
+    this.starterHpR = Math.exp((-TWO_PI * 185.0) / sampleRate);
+    this.starterAirLpAlpha = 1.0 - Math.exp((-TWO_PI * 4800.0) / sampleRate);
 
     // Mode 1: mechanical valvetrain upper-head resonator (fc = 2150 Hz, damped Q = 2.0 -> crisp metallic click, zero ring)
     const fc = 2150.0;
@@ -1052,6 +1156,46 @@ export class PhysicalEngine {
     this.updateSlowThermalAcoustics();
   }
 
+  // Deterministic xorshift32 seed control for reproducible Phase 10 tests (never zero)
+  public setSeed(seed: number): void {
+    const clean = (seed | 0) !== 0 ? seed | 0 : 0x12345678;
+    this.initialSeed = clean;
+    this.rngState = clean;
+  }
+
+  public getSeed(): number {
+    return this.initialSeed;
+  }
+
+  public resetClampStats(): void {
+    this.clampStats.nanOrInfCount = 0;
+    this.clampStats.cylMassFloorCount = 0;
+    this.clampStats.cylEnergyBoundCount = 0;
+    this.clampStats.manMassFloorCount = 0;
+    this.clampStats.manEnergyBoundCount = 0;
+    this.clampStats.manPressureCeilingCount = 0;
+    this.clampStats.waveguideSaturationCount = 0;
+    this.clampStats.freshMassRoundoffClampCount = 0;
+    this.clampStats.iacvActuatorBoundCount = 0;
+    this.clampStats.sparkAdvanceBoundCount = 0;
+  }
+
+  public getExhaustBankL(): ExhaustBank {
+    return this.exhaustBankL;
+  }
+
+  public getExhaustBankR(): ExhaustBank {
+    return this.exhaustBankR;
+  }
+
+  public getHPipe(): WaveguideTube {
+    return this.hPipe;
+  }
+
+  public getIntakeSnorkel(): WaveguideTube {
+    return this.intakeSnorkel;
+  }
+
   private nextRandSigned(): number {
     let x = this.rngState;
     x ^= x << 13;
@@ -1129,7 +1273,7 @@ export class PhysicalEngine {
     }
 
     const wheelOmegaNow = this.vehicleSpeedMps * (1.0 / AT_WHEEL_RADIUS);
-    const shiftAlpha = 1.0 - Math.exp(-this.dt / 0.032);
+    const shiftAlpha = this.shiftAlpha;
 
     if (driveMode === 0) {
       this.currentGear = 0;
@@ -1263,7 +1407,14 @@ export class PhysicalEngine {
         idleBlend * (idleError * 0.0000011 + this.idleIntegral * 0.0000024);
     }
     const minIacv = dfcoActive ? 0.000003 : 0.000016;
-    const clampedIacv = iacvArea < minIacv ? minIacv : iacvArea > 0.00038 ? 0.00038 : iacvArea;
+    let clampedIacv = iacvArea;
+    if (clampedIacv < minIacv) {
+      clampedIacv = minIacv;
+      this.clampStats.iacvActuatorBoundCount++;
+    } else if (clampedIacv > 0.00038) {
+      clampedIacv = 0.00038;
+      this.clampStats.iacvActuatorBoundCount++;
+    }
     // Physical IACV / electronic throttle dashpot actuator smoothing (~15ms time constant prevents 1-sample area jump at DFCO boundary!)
     this.smoothedIacvArea += this.ctrlAlpha * (clampedIacv - this.smoothedIacvArea);
 
@@ -1302,8 +1453,13 @@ export class PhysicalEngine {
     const loadRetard = this.man_P > 55000.0 ? (this.man_P - 55000.0) * (6.0 / 45000.0) : 0.0;
     const shiftRetard = this.smoothedShiftCut * 18.0;
     let advanceDeg = 14.0 + rpmNorm * 22.0 - loadRetard - idleRetard - shiftRetard + idleSparkTrim;
-    if (advanceDeg < -12.0) advanceDeg = -12.0;
-    else if (advanceDeg > 36.0) advanceDeg = 36.0;
+    if (advanceDeg < -12.0) {
+      advanceDeg = -12.0;
+      this.clampStats.sparkAdvanceBoundCount++;
+    } else if (advanceDeg > 36.0) {
+      advanceDeg = 36.0;
+      this.clampStats.sparkAdvanceBoundCount++;
+    }
     const sparkPhaseRad = (360.0 - advanceDeg) * DEG_TO_RAD;
     const baseBurnDurRad = (42.0 + rpmNorm * 12.0 + (1.0 - loadNorm) * 28.0) * DEG_TO_RAD;
 
@@ -1573,19 +1729,38 @@ export class PhysicalEngine {
         const dE_dt = this.inFlow.dE - exDE - cyl.P * dV_dt - wallHeatLossW;
 
         let newMass = cyl.mass + dm * dtSub;
-        if (newMass < 2e-6 || !Number.isFinite(newMass)) newMass = 2e-6;
+        if (!Number.isFinite(newMass)) {
+          newMass = 2e-6;
+          this.clampStats.nanOrInfCount++;
+        } else if (newMass < 2e-6) {
+          newMass = 2e-6;
+          this.clampStats.cylMassFloorCount++;
+        }
         cyl.mass = newMass;
 
         let newFresh = cyl.freshMass + dFresh * dtSub - freshConsumed;
-        if (newFresh < 0.0) newFresh = 0.0;
-        else if (newFresh > newMass) newFresh = newMass;
+        if (newFresh < 0.0) {
+          if (newFresh < -1e-12) this.clampStats.freshMassRoundoffClampCount++;
+          newFresh = 0.0;
+        } else if (newFresh > newMass) {
+          if (newFresh - newMass > 1e-12) this.clampStats.freshMassRoundoffClampCount++;
+          newFresh = newMass;
+        }
         cyl.freshMass = newFresh;
 
         let newEnergy = cyl.energy + dE_dt * dtSub + heatJ;
-        const minE = newMass * U_MIN_220;
+        const minE = newMass * U_MIN_150;
         const maxE = newMass * U_MAX_3800;
-        if (!Number.isFinite(newEnergy) || newEnergy < minE) newEnergy = minE;
-        else if (newEnergy > maxE) newEnergy = maxE;
+        if (!Number.isFinite(newEnergy)) {
+          newEnergy = minE;
+          this.clampStats.nanOrInfCount++;
+        } else if (newEnergy < minE) {
+          newEnergy = minE;
+          this.clampStats.cylEnergyBoundCount++;
+        } else if (newEnergy > maxE) {
+          newEnergy = maxE;
+          this.clampStats.cylEnergyBoundCount++;
+        }
         cyl.energy = newEnergy;
 
         // Exact Cv(T) temperature & ideal gas pressure
@@ -1595,13 +1770,13 @@ export class PhysicalEngine {
         cyl.T = newT;
         cyl.P = newP;
 
-        // Physical cast-block acoustic excitation driven by rapid combustion OR cranking compression pressure rise dP/dt
+        // Physical cast-block acoustic excitation driven by rapid combustion OR subtle cranking compression load
         if (newP > prevP) {
           if (cyl.isBurning) {
             blockImpulse += (newP - prevP) * 1.1e-6;
           } else if (starter && this.omega < 32.0 && newP > 140000.0) {
-            // Heavy rhythmic V8 compression thud ("chug-chug-chug") against the block during starter cranking!
-            blockImpulse += (newP - prevP) * 7.5e-6;
+            // Subtle cast-iron block compression thump (kept restrained so 520 Hz block mode never rings/wobbles!)
+            blockImpulse += (newP - prevP) * 2.2e-6;
           }
         }
 
@@ -1614,26 +1789,44 @@ export class PhysicalEngine {
       // Integrate intake manifold plenum state + mild wall thermal equilibration
       const manHeatTransfer = 18.0 * (T_ATM + 15.0 - this.man_T);
       let newManMass = this.man_mass + man_dm * dtSub;
-      if (newManMass < 2e-4 || !Number.isFinite(newManMass)) newManMass = 2e-4;
+      if (!Number.isFinite(newManMass)) {
+        newManMass = 2e-4;
+        this.clampStats.nanOrInfCount++;
+      } else if (newManMass < 2e-4) {
+        newManMass = 2e-4;
+        this.clampStats.manMassFloorCount++;
+      }
       this.man_mass = newManMass;
 
       let newManEnergy = this.man_energy + (man_dE + manHeatTransfer) * dtSub;
       const manMinE = newManMass * U_MIN_220;
       const manMaxE = newManMass * U_MAX_700;
-      if (!Number.isFinite(newManEnergy) || newManEnergy < manMinE) newManEnergy = manMinE;
-      else if (newManEnergy > manMaxE) newManEnergy = manMaxE;
+      if (!Number.isFinite(newManEnergy)) {
+        newManEnergy = manMinE;
+        this.clampStats.nanOrInfCount++;
+      } else if (newManEnergy < manMinE) {
+        newManEnergy = manMinE;
+        this.clampStats.manEnergyBoundCount++;
+      } else if (newManEnergy > manMaxE) {
+        newManEnergy = manMaxE;
+        this.clampStats.manEnergyBoundCount++;
+      }
       this.man_energy = newManEnergy;
 
       this.man_T = tempFromSpecificEnergy(newManEnergy / newManMass);
       let newManP = newManMass * R_GAS * this.man_T * this.invManV;
-      if (newManP > 250000.0) newManP = 250000.0;
+      if (newManP > 250000.0) {
+        newManP = 250000.0;
+        this.clampStats.manPressureCeilingCount++;
+      }
       this.man_P = newManP;
 
       // Realistic 4.58L DOHC V8 FMEP + oil/water/alternator accessory drag (~51 Nm @ 750 RPM idle -> authentic ~35 kPa MAP & 1.38 bar EVO lope!)
       const omegaSign = fastTanh(this.omega * (1.0 / 12.0));
       const frictionTorque = (48.0 + 0.045 * this.omega + 0.00012 * this.omega * this.omega) * omegaSign;
-      // Realistic 1.8 kW 12V planetary reduction starter motor with overrunning bendix clutch (198 Nm stall, disengages at ~380 RPM = 40 rad/s)
-      const starterTorque = starter && this.omega < 30.0 ? 198.0 * (1.0 - this.omega * (1.0 / 34.0)) : 0.0;
+      // Realistic 1.8 kW 12V planetary reduction starter motor with overrunning bendix clutch (steep DC back-EMF curve -> ~185 RPM nominal crank)
+      const starterCoupled = starter && this.omega < 26.5;
+      const starterTorque = starterCoupled ? 275.0 * (1.0 - this.omega * (1.0 / 26.5)) : 0.0;
       const dynoBrakeTorque = loadTorque * omegaSign;
 
       // 6-Speed Hydraulic Torque-Converter & Lock-Up Automatic Drivetrain Load:
@@ -1692,7 +1885,9 @@ export class PhysicalEngine {
       }
 
       const netTorque = stepTorque + starterTorque - frictionTorque - dynoBrakeTorque - transPumpTorque;
-      let nextOmega = this.omega + netTorque * this.invInertia * dtSub;
+      // Include physical reflected 38:1 starter armature inertia (+0.45 kg*m^2) while bendix pinion is engaged (authentic ~+/-12% V8 crank cadence!)
+      const effInvInertia = starterCoupled ? 1.0 / (this.inertia + 0.45) : this.invInertia;
+      let nextOmega = this.omega + netTorque * effInvInertia * dtSub;
       if (nextOmega < 0.0 || !Number.isFinite(nextOmega)) nextOmega = 0.0;
       this.omega = nextOmega;
 
@@ -1736,19 +1931,19 @@ export class PhysicalEngine {
       }
     }
 
-    // Step dual exhaust banks (with dynamic temperature, nonlinear steepening, H-pipe, and velocity-scaled jet)
+    // Step dual exhaust banks (with dynamic temperature, nonlinear steepening, H-pipe admittance Y = A/c, and velocity-scaled jet)
     const tTail = T_ATM + ((this.exhaustPortT > T_ATM ? this.exhaustPortT : T_ATM) - T_ATM) * 0.52;
     const outL = this.exhaustBankL.step(
       bankFlowsL,
       this.hPipe.pMinusOut,
-      this.hPipe.area,
+      this.hPipe.Y,
       tTail,
       this.nextRandSigned()
     );
     const outR = this.exhaustBankR.step(
       bankFlowsR,
       this.hPipe.pPlusOut,
-      this.hPipe.area,
+      this.hPipe.Y,
       tTail,
       this.nextRandSigned()
     );
@@ -1803,12 +1998,16 @@ export class PhysicalEngine {
     this.runY2 = this.runY1;
     this.runY1 = runOut;
 
-    // Physical DC starter motor & planetary reduction gear drive (NO bandpass filter modulation or white-noise hiss!):
-    // 1. Solenoid & bendix pinion engagement metallic clunk when starter button is pressed
+    // Physical 12V PMGR DC starter motor & planetary reduction drive (ZERO resonant filter wobble, ZERO sine oscillators!):
+    // 1. Solenoid plunger throw-in CLACK on engage & subtle bendix spring retract tick on disengage
     const starterEngaged = starter && this.omega < 26.0;
     if (starterEngaged && !this.prevStarterEngaged) {
-      mechImpulse += 1.65;
-      blockImpulse += 1.10;
+      this.starterSolenoidEnv = 1.0;
+      mechImpulse += 1.25;
+      blockImpulse += 0.65;
+    } else if (!starterEngaged && this.prevStarterEngaged) {
+      this.starterSolenoidEnv = 0.32;
+      mechImpulse += 0.35;
     }
     this.prevStarterEngaged = starterEngaged;
 
@@ -1837,41 +2036,105 @@ export class PhysicalEngine {
     this.blockY2 = this.blockY1;
     this.blockY1 = blockOut;
 
-    // 2. Direct wideband electromechanical starter kinematics (ZERO resonant bandpass filter modulation, ZERO random white noise!):
-    // - Compression-torque load envelope from instantaneous cylinder compression pressure (maxCylP)
-    // - 11-tooth pinion on 132-tooth flywheel ring-gear (12:1) + 3.5:1 planetary sun gear (42:1 total armature ratio)
-    // - Combines low-frequency pinion shaft compression groan (12x crank), sharp rectified involute tooth-mesh clicks (132x crank),
-    //   and 3-pole DC armature torque ripple (126x crank) directly through a warm 1650 Hz lowpass!
+    // 2. Physical discrete-impact spur-gear mesh + 16-bar copper commutator whir + overrunning-clutch armature spin-down:
     const compLoad = maxCylP > P_ATM ? Math.min(1.0, (maxCylP - P_ATM) * (1.0 / 950000.0)) : 0.0;
-    const starterStrain = 0.25 + 0.75 * compLoad;
-    const starterTarget = starterEngaged ? starterStrain : 0.0;
+    const starterTarget = starterEngaged ? 1.0 : 0.0;
     const sAlpha = starterTarget > this.starterEnv ? this.starterAttackAlpha : this.starterReleaseAlpha;
     this.starterEnv += sAlpha * (starterTarget - this.starterEnv);
 
-    let starterAudio = 0.0;
-    if (this.starterEnv > 0.0005 && this.omega > 0.5) {
-      // Advance flywheel ring-gear tooth phase (132 teeth/rev; wrap at 22*PI so 1/11th pinion phase is continuous)
-      this.starterPhase += this.omega * 132.0 * this.dt;
-      const PINION_WRAP = 22.0 * Math.PI;
-      if (this.starterPhase >= PINION_WRAP) this.starterPhase -= PINION_WRAP;
-      const pTooth = this.starterPhase;
-      const pPinion = pTooth * (1.0 / 11.0); // Pinion shaft rotation (~36 Hz at 180 RPM cranking)
-
-      // a) Heavy low-mid pinion & planetary carrier torque groan under compression load (~36 Hz + ~72 Hz)
-      const pinionGroan = (Math.sin(pPinion) + 0.45 * Math.sin(2.0 * pPinion + 0.6)) * (0.35 + 0.65 * compLoad);
-      // b) Sharp rectified involute gear-tooth contact impulses (~395 Hz at 180 RPM)
-      const sTooth = Math.sin(pTooth);
-      const cTooth = Math.cos(pTooth);
-      const toothContact = (sTooth * sTooth * sTooth + 0.38 * sTooth * cTooth) * (0.65 + 0.35 * Math.cos(pPinion));
-      // c) 3-pole DC armature electromagnetic torque ripple (42*3 = 126x crank = 21/22 of pTooth -> natural mechanical beating with ring gear!)
-      const armatureRipple = Math.sin(pPinion * 10.5) * 0.28 * (0.4 + 0.6 * compLoad);
-
-      const rawStarter = (pinionGroan * 0.52 + toothContact * 0.38 + armatureRipple) * this.starterEnv;
-      this.starterLp += this.starterLpAlpha * (rawStarter - this.starterLp);
-      starterAudio = this.starterLp * 0.24;
+    // High-speed DC armature rotor speed (38:1 coupled while engaged; freewheels down over ~120ms when bendix overruns!)
+    if (starterEngaged) {
+      const targetArmOmega = this.omega * 38.0;
+      this.starterArmatureOmega += this.starterArmAlpha * (targetArmOmega - this.starterArmatureOmega);
+    } else if (this.starterArmatureOmega > 2.0) {
+      this.starterArmatureOmega *= 1.0 - this.dt * 9.5;
+      if (this.starterArmatureOmega < 2.0) this.starterArmatureOmega = 0.0;
     } else {
-      this.starterLp = Math.abs(this.starterLp) > 1e-6 ? this.starterLp * 0.94 : 0.0;
-      starterAudio = this.starterLp * 0.24;
+      this.starterArmatureOmega = 0.0;
+    }
+
+    let starterAudio = 0.0;
+    if (this.starterEnv > 0.0005 || this.starterArmatureOmega > 5.0 || this.starterSolenoidEnv > 0.001) {
+      // a) Flywheel 132-tooth ring-gear <-> 11-tooth bendix pinion straight-cut steel tooth strikes (~400-440 strikes/s)
+      if (this.starterEnv > 0.0005 && this.omega > 0.4) {
+        this.starterRingPos += this.omega * (132.0 / TWO_PI) * this.dt;
+        const currRingIdx = this.starterRingPos | 0;
+        if (currRingIdx !== this.starterRingLastIdx) {
+          this.starterRingLastIdx = currRingIdx;
+          const rIdx = currRingIdx % 132;
+          const pIdx = currRingIdx % 11;
+          const toothAmp =
+            this.ringToothProfile[rIdx] *
+            this.pinionToothProfile[pIdx] *
+            (0.45 + 0.55 * compLoad) *
+            this.starterEnv;
+          this.starterToothPulse += toothAmp;
+          this.starterToothRebound += toothAmp * 0.58;
+        }
+        if (this.starterRingPos >= 1452.0) {
+          // Wrap cleanly at LCM(132, 11) = 132 * 11 = 1452 teeth so both ring & pinion indices remain phase-exact
+          this.starterRingPos -= 1452.0;
+          this.starterRingLastIdx -= 1452;
+        }
+      }
+      this.starterToothPulse *= this.starterToothDecay;
+      this.starterToothRebound *= this.starterReboundDecay;
+      const toothWave = this.starterToothPulse - 0.44 * this.starterToothRebound;
+      this.starterToothLp += this.starterToothLpAlpha * (toothWave - this.starterToothLp);
+
+      // b) High-speed 16-bar copper commutator & planetary gear whir (~1850-2150 bars/s; spins down naturally after catch!)
+      if (this.starterArmatureOmega > 5.0) {
+        this.starterCommPos += this.starterArmatureOmega * (16.0 / TWO_PI) * this.dt;
+        const currCommIdx = this.starterCommPos | 0;
+        if (currCommIdx !== this.starterCommLastIdx) {
+          this.starterCommLastIdx = currCommIdx;
+          const barIdx = currCommIdx & 15;
+          const spinFade = Math.min(1.0, this.starterArmatureOmega * (1.0 / 320.0));
+          const loadMod = starterEngaged ? 0.55 + 0.45 * compLoad : 0.35;
+          const barAmp =
+            this.commBarProfile[barIdx] *
+            loadMod *
+            spinFade *
+            (0.74 + 0.26 * this.nextRandSigned());
+          this.starterCommPulse += barAmp;
+        }
+        if (this.starterCommPos >= 16384.0) {
+          this.starterCommPos -= 16384.0;
+          this.starterCommLastIdx -= 16384;
+        }
+      }
+      this.starterCommPulse *= this.starterCommDecay;
+      this.starterCommLp += this.starterCommLpAlpha * (this.starterCommPulse - this.starterCommLp);
+
+      // c) Dry metallic solenoid throw-in CLACK (~8ms broadband contact strike)
+      let solenoidClick = 0.0;
+      if (this.starterSolenoidEnv > 0.001) {
+        solenoidClick = this.starterSolenoidEnv * (0.65 * this.nextRandSigned() + 0.35);
+        this.starterSolenoidEnv *= this.starterSolenoidDecay;
+      } else {
+        this.starterSolenoidEnv = 0.0;
+      }
+
+      // Combine wideband steel tooth mesh + high-speed DC commutator/planetary whir + solenoid clack
+      // Shaped ONLY with non-resonant 1-pole 185 Hz HP (zero 47 Hz bass wobble!) + 4.8 kHz LP (zero resonant filter peak!)
+      const rawStarter =
+        this.starterToothLp * 0.28 +
+        this.starterCommLp * 0.16 +
+        solenoidClick * 0.30;
+      const hpOut = rawStarter - this.starterHpX1 + this.starterHpR * this.starterHpY1;
+      this.starterHpX1 = rawStarter;
+      this.starterHpY1 = hpOut;
+      this.starterAirLp += this.starterAirLpAlpha * (hpOut - this.starterAirLp);
+      starterAudio = this.starterAirLp;
+    } else {
+      this.starterToothPulse = 0.0;
+      this.starterToothRebound = 0.0;
+      this.starterToothLp = 0.0;
+      this.starterCommPulse = 0.0;
+      this.starterCommLp = 0.0;
+      this.starterHpX1 = 0.0;
+      this.starterHpY1 = 0.0;
+      this.starterAirLp = 0.0;
     }
 
     // Telemetry smoothing
@@ -1881,8 +2144,8 @@ export class PhysicalEngine {
     this.avgPower += this.powerAlpha * (instPower - this.avgPower);
 
     // Dynamic microphone staging: calibrated for crisp exterior Levine-Schwinger open-pipe radiation!
-    // Preserves natural high crest factor (>2.3) even at 7000 RPM WOT while boosting low-RPM cranking compression chugs!
-    const crankBoost = this.omega < 38.0 ? 1.0 + (1.0 - this.omega * (1.0 / 38.0)) * 2.2 : 1.0;
+    // Preserves natural high crest factor (>2.3) even at 7000 RPM WOT while bringing up real V8 compression air-pumping during cranking!
+    const crankBoost = this.omega < 38.0 ? 1.0 + (1.0 - this.omega * (1.0 / 38.0)) * 3.4 : 1.0;
     const loadScale = (0.00014 + 0.00034 * (1.0 - 0.76 * loadNorm) * (1.0 - 0.62 * rpmNorm)) * crankBoost;
     const exScaledL = outL.radiatedAudio * loadScale + outL.jetAudio;
     const exScaledR = outR.radiatedAudio * loadScale + outR.jetAudio;
@@ -1903,6 +2166,28 @@ export class PhysicalEngine {
     const inDc = inScaled - this.dcIn_x1 + this.dcR * this.dcIn_y1;
     this.dcIn_x1 = inScaled;
     this.dcIn_y1 = Number.isFinite(inDc) ? inDc : 0.0;
+
+    this.clampStats.waveguideSaturationCount =
+      this.exhaustBankL.primaries[0].saturationCount +
+      this.exhaustBankL.primaries[1].saturationCount +
+      this.exhaustBankL.primaries[2].saturationCount +
+      this.exhaustBankL.primaries[3].saturationCount +
+      this.exhaustBankL.midpipe.saturationCount +
+      this.exhaustBankL.mufflerCore.saturationCount +
+      this.exhaustBankL.mufflerOuter.saturationCount +
+      this.exhaustBankL.mufflerBranch.saturationCount +
+      this.exhaustBankL.tailpipe.saturationCount +
+      this.exhaustBankR.primaries[0].saturationCount +
+      this.exhaustBankR.primaries[1].saturationCount +
+      this.exhaustBankR.primaries[2].saturationCount +
+      this.exhaustBankR.primaries[3].saturationCount +
+      this.exhaustBankR.midpipe.saturationCount +
+      this.exhaustBankR.mufflerCore.saturationCount +
+      this.exhaustBankR.mufflerOuter.saturationCount +
+      this.exhaustBankR.mufflerBranch.saturationCount +
+      this.exhaustBankR.tailpipe.saturationCount +
+      this.hPipe.saturationCount +
+      this.intakeSnorkel.saturationCount;
 
     this.result.exhaustAudioL = softLimit(this.dcExL_y1);
     this.result.exhaustAudioR = softLimit(this.dcExR_y1);
