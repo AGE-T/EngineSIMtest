@@ -296,8 +296,13 @@ export class WaveguideTube {
   public readonly area: number;
   private readonly invArea: number;
   private readonly lenTimesSr: number;
-  public Z: number; // Acoustic mass-flow impedance c / A [Pa / (kg/s)]
-  public Y: number; // Acoustic mass-flow admittance A / c = 1 / Z [(kg/s) / Pa]
+  public c: number;      // Local speed of sound [m/s]
+  public T_gas: number;  // Reference section gas temperature [K]
+  public rho: number;    // Reference section gas density P_ATM / (R_GAS * T_gas) [kg/m^3]
+  public Z: number;      // Acoustic mass-flow characteristic impedance Z_m = c / A [Pa / (kg/s)]
+  public Y: number;      // Acoustic mass-flow characteristic admittance Y_m = A / c = 1 / Z_m [(kg/s) / Pa]
+  public ZVol: number;   // Physical volumetric acoustic impedance Z_vol = (rho * c) / A [Pa / (m^3/s)]
+  public YVol: number;   // Physical volumetric acoustic admittance Y_vol = A / (rho * c) = Y_m / rho [(m^3/s) / Pa]
   private baseDelay: number;
   private maxShift: number;
   public saturationCount: number = 0;
@@ -308,7 +313,8 @@ export class WaveguideTube {
     initialSpeedOfSound: number,
     sampleRate: number,
     lossPerPass: number,
-    wallCutoffHz: number
+    wallCutoffHz: number,
+    initialGasTempK: number = T_ATM
   ) {
     this.lengthMeters = lengthMeters;
     this.lenTimesSr = lengthMeters * sampleRate;
@@ -320,8 +326,13 @@ export class WaveguideTube {
     this.bwdBuf = new Float32Array(this.bufSize);
     this.area = Math.PI * 0.25 * diameterMeters * diameterMeters;
     this.invArea = 1.0 / this.area;
+    this.c = initialSpeedOfSound;
+    this.T_gas = initialGasTempK > 50.0 ? initialGasTempK : T_ATM;
+    this.rho = P_ATM / (R_GAS * this.T_gas);
     this.Z = initialSpeedOfSound * this.invArea;
     this.Y = this.area / initialSpeedOfSound;
+    this.ZVol = this.rho * this.Z;
+    this.YVol = this.Y / this.rho;
     this.baseDelay = this.lenTimesSr / initialSpeedOfSound;
     // Allow authentic Burgers crest advance (up to ~7.5 samples) with strict slew-rate monotonicity
     this.maxShift = Math.min(7.5, this.baseDelay * 0.20);
@@ -336,9 +347,19 @@ export class WaveguideTube {
     this.nlModAlpha = dt / (rcNl + dt);
   }
 
-  public updateSpeedOfSound(speedOfSound: number): void {
+  public updateSpeedOfSound(speedOfSound: number, gasTempK?: number): void {
+    this.c = speedOfSound;
+    if (gasTempK !== undefined && gasTempK > 50.0) {
+      this.T_gas = gasTempK;
+    } else {
+      // Invert ideal-gas speed of sound approximation when explicit temperature is omitted
+      this.T_gas = Math.max(150.0, (speedOfSound * speedOfSound) / (1.36 * R_GAS));
+    }
+    this.rho = P_ATM / (R_GAS * this.T_gas);
     this.Z = speedOfSound * this.invArea;
     this.Y = this.area / speedOfSound;
+    this.ZVol = this.rho * this.Z;
+    this.YVol = this.Y / this.rho;
     this.baseDelay = this.lenTimesSr / speedOfSound;
     this.maxShift = Math.min(7.5, this.baseDelay * 0.20);
   }
@@ -524,15 +545,22 @@ export class ExhaustBank {
     this.jetA2 = (1.0 - alpha) / a0;
   }
 
-  public updateSpeedsOfSound(cPrim: number, cMid: number, cTail: number): void {
+  public updateSpeedsOfSound(
+    cPrim: number,
+    cMid: number,
+    cTail: number,
+    tPrim?: number,
+    tMid?: number,
+    tTail?: number
+  ): void {
     for (let i = 0; i < 4; i++) {
-      this.primaries[i].updateSpeedOfSound(cPrim);
+      this.primaries[i].updateSpeedOfSound(cPrim, tPrim);
     }
-    this.midpipe.updateSpeedOfSound(cMid);
-    this.mufflerCore.updateSpeedOfSound(cTail);
-    this.mufflerOuter.updateSpeedOfSound(cTail * 0.93);
-    this.mufflerBranch.updateSpeedOfSound(cTail);
-    this.tailpipe.updateSpeedOfSound(cTail);
+    this.midpipe.updateSpeedOfSound(cMid, tMid);
+    this.mufflerCore.updateSpeedOfSound(cTail, tTail);
+    this.mufflerOuter.updateSpeedOfSound(cTail * 0.93, tTail);
+    this.mufflerBranch.updateSpeedOfSound(cTail, tTail);
+    this.tailpipe.updateSpeedOfSound(cTail, tTail);
   }
 
   public readAll(): void {
@@ -746,8 +774,12 @@ export class Cylinder {
     this.bankIndex = bankIndex;
     this.flowTrim = flowTrim;
     this.sparkTrimRad = sparkTrimDeg * DEG_TO_RAD;
+    // Initial cylinder state: T_0 = T_ATM + 35.0 = 330.0 K, P_0 = 38000.0 Pa (warm idle manifold vacuum equilibrium).
+    // Note (Phase 10.1 WP-C): On the first half-revolution from TDC, a closed cylinder at 38 kPa and 330 K expands by CR = 10.2x
+    // down to T_min ~ 165.4 K before intake valve opening. Because minE = newMass * U_MIN_150 (150 K, aligned with tempFromSpecificEnergy's
+    // 150 K lower limit), this initial expansion produces 0 recovery clamps while preserving the exact warm-idle startup trajectory.
     this.T = T_ATM + 35.0;
-    this.P = 38000.0; // Matches warm running idle equilibrium (prevents artificial 1500 RPM launch spike on init)
+    this.P = 38000.0;
     this.mass = (this.P * initialV) / (R_GAS * this.T);
     this.freshMass = this.mass * 0.72;
     this.energy = this.mass * specificEnergyFromT(this.T);
@@ -787,6 +819,24 @@ export interface ClampDiagnostics {
   freshMassRoundoffClampCount: number;
   iacvActuatorBoundCount: number;
   sparkAdvanceBoundCount: number;
+}
+
+// Phase 10.1 WP-B: Zero-allocation engine-level First-Law control-volume energy ledger
+export interface EngineEnergyLedger {
+  stepsAccumulated: number;
+  simTimeAccumulatedSec: number;
+  // Cylinder control-volume integrated energy fluxes [J]
+  cylIntakeEnthalpyJ: number;
+  cylExhaustEnthalpyJ: number;
+  cylCombustionHeatJ: number;
+  cylWallHeatLossJ: number;
+  cylPistonWorkPdVJ: number;
+  // Crankshaft mechanical indicated work integrated from gross indicated gas torque [J]
+  crankGrossIndicatedWorkJ: number;
+  // Intake manifold control-volume integrated energy fluxes [J]
+  manThrottleEnthalpyInJ: number;
+  manCylEnthalpyOutJ: number;
+  manWallHeatExchangeJ: number;
 }
 
 const ANGLE_LUT_SIZE = 1024;
@@ -992,6 +1042,20 @@ export class PhysicalEngine {
     sparkAdvanceBoundCount: 0,
   };
 
+  public readonly energyLedger: EngineEnergyLedger = {
+    stepsAccumulated: 0,
+    simTimeAccumulatedSec: 0.0,
+    cylIntakeEnthalpyJ: 0.0,
+    cylExhaustEnthalpyJ: 0.0,
+    cylCombustionHeatJ: 0.0,
+    cylWallHeatLossJ: 0.0,
+    cylPistonWorkPdVJ: 0.0,
+    crankGrossIndicatedWorkJ: 0.0,
+    manThrottleEnthalpyInJ: 0.0,
+    manCylEnthalpyOutJ: 0.0,
+    manWallHeatExchangeJ: 0.0,
+  };
+
   constructor(sampleRate: number, seed: number = 0x12345678) {
     this.sampleRate = sampleRate;
     this.dt = 1.0 / sampleRate;
@@ -1180,6 +1244,58 @@ export class PhysicalEngine {
     this.clampStats.sparkAdvanceBoundCount = 0;
   }
 
+  public resetEnergyLedger(): void {
+    this.energyLedger.stepsAccumulated = 0;
+    this.energyLedger.simTimeAccumulatedSec = 0.0;
+    this.energyLedger.cylIntakeEnthalpyJ = 0.0;
+    this.energyLedger.cylExhaustEnthalpyJ = 0.0;
+    this.energyLedger.cylCombustionHeatJ = 0.0;
+    this.energyLedger.cylWallHeatLossJ = 0.0;
+    this.energyLedger.cylPistonWorkPdVJ = 0.0;
+    this.energyLedger.crankGrossIndicatedWorkJ = 0.0;
+    this.energyLedger.manThrottleEnthalpyInJ = 0.0;
+    this.energyLedger.manCylEnthalpyOutJ = 0.0;
+    this.energyLedger.manWallHeatExchangeJ = 0.0;
+  }
+
+  // Exact analytical slider-crank cylinder volume V(theta) [m^3] at the current crankAngle
+  // (independent of the 1024-entry LUT)
+  public computeCylinderExactVolume(cylIdx: number): number {
+    const cyl = this.cylinders[cylIdx];
+    let angle = (this.crankAngle + cyl.phaseOffset) % FOUR_PI;
+    if (angle < 0.0) angle += FOUR_PI;
+    const s = Math.sin(angle);
+    const c = Math.cos(angle);
+    const term = Math.sqrt(this.conrod * this.conrod - this.r * this.r * s * s);
+    const x = this.r * c + term;
+    const strokeDisp = this.conrod + this.r - x;
+    return this.V_c + this.pistonArea * strokeDisp;
+  }
+
+  // State-reconstructed total internal energy across all 8 cylinders from macroscopic (P_i, V_i, m_i)
+  // via the ideal-gas state relation T_i = P_i * V_i / (m_i * R_GAS) and exact Cv(T) integral u(T)
+  public computeTotalCylinderInternalEnergyFromState(): number {
+    let totalU = 0.0;
+    for (let i = 0; i < 8; i++) {
+      const cyl = this.cylinders[i];
+      let angle = cyl.lastAngle;
+      if (angle >= FOUR_PI) angle -= FOUR_PI;
+      const pos = angle * ANGLE_TO_LUT;
+      const idx = pos | 0;
+      const frac = pos - idx;
+      const V = this.lutV[idx] + frac * (this.lutV[idx + 1] - this.lutV[idx]);
+      const T_state = (cyl.P * V) / (cyl.mass * R_GAS);
+      totalU += cyl.mass * (CV_C0 * T_state + 0.5 * CV_C1 * T_state * T_state);
+    }
+    return totalU;
+  }
+
+  // State-reconstructed intake manifold internal energy from macroscopic (man_P, man_V, man_mass)
+  public computeManifoldInternalEnergyFromState(): number {
+    const T_state = (this.man_P * this.man_V) / (this.man_mass * R_GAS);
+    return this.man_mass * (CV_C0 * T_state + 0.5 * CV_C1 * T_state * T_state);
+  }
+
   public getExhaustBankL(): ExhaustBank {
     return this.exhaustBankL;
   }
@@ -1214,12 +1330,12 @@ export class PhysicalEngine {
     const cMid = speedOfSoundFromT(tMid);
     const cTail = speedOfSoundFromT(tTail);
 
-    this.exhaustBankL.updateSpeedsOfSound(cPrim, cMid, cTail);
-    this.exhaustBankR.updateSpeedsOfSound(cPrim, cMid, cTail);
-    this.hPipe.updateSpeedOfSound(cMid);
+    this.exhaustBankL.updateSpeedsOfSound(cPrim, cMid, cTail, tPrim, tMid, tTail);
+    this.exhaustBankR.updateSpeedsOfSound(cPrim, cMid, cTail, tPrim, tMid, tTail);
+    this.hPipe.updateSpeedOfSound(cMid, tMid);
 
     const cIntake = speedOfSoundFromT(this.man_T);
-    this.intakeSnorkel.updateSpeedOfSound(cIntake);
+    this.intakeSnorkel.updateSpeedOfSound(cIntake, this.man_T);
   }
 
   private updateSlowThermalAcoustics(): void {
@@ -1726,7 +1842,15 @@ export class PhysicalEngine {
 
         // Integrate cylinder mass, fresh charge, and internal energy
         const dm = inDm - exDm;
-        const dE_dt = this.inFlow.dE - exDE - cyl.P * dV_dt - wallHeatLossW;
+        const pWorkRateW = cyl.P * dV_dt;
+        const dE_dt = this.inFlow.dE - exDE - pWorkRateW - wallHeatLossW;
+
+        // Accumulate independent control-volume energy fluxes into First-Law ledger
+        this.energyLedger.cylIntakeEnthalpyJ += this.inFlow.dE * dtSub;
+        this.energyLedger.cylExhaustEnthalpyJ += exDE * dtSub;
+        this.energyLedger.cylCombustionHeatJ += heatJ;
+        this.energyLedger.cylWallHeatLossJ += wallHeatLossW * dtSub;
+        this.energyLedger.cylPistonWorkPdVJ += pWorkRateW * dtSub;
 
         let newMass = cyl.mass + dm * dtSub;
         if (!Number.isFinite(newMass)) {
@@ -1784,10 +1908,18 @@ export class PhysicalEngine {
         if (newP > maxCylP) maxCylP = newP;
 
         stepTorque += (newP - P_ATM) * pistonArea * -dx_dtheta;
+        // Gross mechanical indicated work on crankshaft: tau_gross * dTheta = newP * A_p * (-dx/dtheta) * omega * dtSub
+        this.energyLedger.crankGrossIndicatedWorkJ += newP * pistonArea * -dx_dtheta * omegaNow * dtSub;
       }
 
       // Integrate intake manifold plenum state + mild wall thermal equilibration
       const manHeatTransfer = 18.0 * (T_ATM + 15.0 - this.man_T);
+      this.energyLedger.stepsAccumulated += 1;
+      this.energyLedger.simTimeAccumulatedSec += dtSub;
+      this.energyLedger.manThrottleEnthalpyInJ += this.throttleFlow.dE * dtSub;
+      this.energyLedger.manCylEnthalpyOutJ += (this.throttleFlow.dE - man_dE) * dtSub;
+      this.energyLedger.manWallHeatExchangeJ += manHeatTransfer * dtSub;
+
       let newManMass = this.man_mass + man_dm * dtSub;
       if (!Number.isFinite(newManMass)) {
         newManMass = 2e-4;

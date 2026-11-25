@@ -433,25 +433,30 @@ Establish hard limits.
   },
   {
     id: "phase10-validation",
-    title: "16. Phase 10 Physics & Acoustic Validation Reference",
+    title: "16. Phase 10 & 10.1 Physics & Acoustic Validation Reference",
     content: `
-# Phase 10 Physics & Acoustic Validation Reference
+# Phase 10 & 10.1 Physics & Acoustic Validation Reference
 
-Phase 10 establishes reproducible mathematical, thermodynamic, acoustic, and real-time CPU validation for \`PhysicalEngine\` (\`src/audio/phase9Engine.ts\`) via \`npm test\` (\`tests/phase10Validation.ts\`).
+Phase 10 and Phase 10.1 establish reproducible mathematical, thermodynamic, acoustic, and real-time CPU validation for \`PhysicalEngine\` (\`src/audio/phase9Engine.ts\`) via \`npm test\` (\`tests/phase10Validation.ts\`).
 
-## 1. Mass-Flow Admittance Junction Scattering ($Y_i = A_i / c_i$)
-In \`phase9Engine.ts\`, each waveguide branch defines characteristic impedance with respect to **mass flow rate** $\\dot{m}_i = \\rho_i U_i$ $[\\text{kg/s}]$:
-$$Z_i = \\frac{c_i}{A_i} \\quad [\\text{Pa}/(\\text{kg/s})], \\qquad Y_i = \\frac{1}{Z_i} = \\frac{A_i}{c_i} \\quad [(\\text{kg/s})/\\text{Pa}]$$
-Because gas density $\\rho_i$ is already absorbed in $\\dot{m}_i = \\rho_i A_i u_i = (p_i^+ - p_i^-) / Z_i$, enforcing pressure continuity ($p_i^{\\text{in}} + p_i^{\\text{out}} = P_J$) and mass-flow conservation ($\\sum_{i=1}^N \\dot{m}_{i,\\text{into J}} = 0$) at an $N$-port junction across temperature gradients ($c_{\\text{prim}} \\neq c_{\\text{mid}} \\neq c_{\\text{tail}}$) yields:
-$$P_J = \\frac{2 \\sum_{i=1}^N Y_i\\, p_i^{\\text{in}}}{\\sum_{i=1}^N Y_i}, \\qquad p_i^{\\text{out}} = P_J - p_i^{\\text{in}}$$
-This guarantees exact mass conservation ($|\\sum \\dot{m}_i| / \\sum |\\dot{m}_i| < 10^{-15}$) and lossless wave-power conservation ($\\sum Y_i (p_i^{\\text{out}})^2 = \\sum Y_i (p_i^{\\text{in}})^2$).
+## 1. Multi-Port Junction Scattering: Mass-Flow Admittance vs. Physical Acoustic Power (Phase 10.1 WP-A)
+In \`phase9Engine.ts\`, each \`WaveguideTube\` tracks both **mass-flow** and **volumetric** characteristic impedances/admittances at section gas state $(T_i, \\rho_i = P_{\\text{atm}}/(R_{\\text{gas}} T_i), c_i = \\sqrt{\\gamma(T_i) R_{\\text{gas}} T_i})$:
+*   **Mass-flow impedance & admittance:**
+    $$Z_{m,i} = \\frac{c_i}{A_i} \\quad [\\text{Pa}/(\\text{kg/s})], \\qquad Y_{m,i} = \\frac{A_i}{c_i} \\quad [(\\text{kg/s})/\\text{Pa}], \\qquad \\dot{m}_i = Y_{m,i}(p_i^+ - p_i^-) \\quad [\\text{kg/s}]$$
+*   **Physical volumetric acoustic impedance & admittance:**
+    $$Z_{\\text{vol},i} = \\frac{\\rho_i c_i}{A_i} \\quad [\\text{Pa}/(\\text{m}^3/\\text{s})], \\qquad Y_{\\text{vol},i} = \\frac{A_i}{\\rho_i c_i} = \\frac{Y_{m,i}}{\\rho_i} \\quad [(\\text{m}^3/\\text{s})/\\text{Pa}], \\qquad U_{\\text{vol},i} = Y_{\\text{vol},i}(p_i^+ - p_i^-) \\quad [\\text{m}^3/\\text{s}]$$
 
-## 2. Exact $C^1$-Clamped \`[3/4]\` Rational \`fastTanh\` Approximant
-The legacy \`[3/2]\` Padé approximation $x(27+x^2)/(27+9x^2)$ had a maximum absolute error of **$0.023520$ at $|x| = 1.5660$**. Phase 10 replaces it with an exact $C^1$-clamped \`[3/4]\` rational approximant on $[-4.07, 4.07]$:
-$$R(x) = \\frac{x (C_0 + N_2 x^2)}{C_0 + x^2 (D_2 + x^2)}, \\quad C_0 = 163.88050423825393,\\; N_2 = 13.171696172305033,\\; D_2 = 67.41614521033179$$
-Verified across a 200,001-point grid:
-*   **Maximum absolute error:** $0.0007217 < 0.00073$ (at $|x| = 2.3487$), a **32.6x error reduction**.
-*   **Exact $C^1$ saturation:** $R(\\pm 4.07) = \\pm 1$ and $R'(\\pm 4.07) = 0$.
+Enforcing pressure continuity ($p_i^+ + p_i^- = P_J$) and mass-flow continuity ($\\sum_{i=1}^N \\dot{m}_i = 0$) yields:
+$$P_J = \\frac{2 \\sum_{i=1}^N Y_{m,i}\\, p_i^+}{\\sum_{i=1}^N Y_{m,i}}, \\qquad p_i^- = P_J - p_i^+$$
+This satisfies the exact algebraic mass-admittance quadratic invariant $\\sum_{i=1}^N Y_{m,i} (p_i^-)^2 = \\sum_{i=1}^N Y_{m,i} (p_i^+)^2$.
+Physical plane-wave acoustic power is $P_{\\text{ac},i} = p_i U_{\\text{vol},i} = Y_{\\text{vol},i}((p_i^+)^2 - (p_i^-)^2) = \\frac{A_i}{\\rho_i c_i}((p_i^+)^2 - (p_i^-)^2)$ $[\\text{W}]$. When all ports at a compact junction share a common local junction gas density $\\rho_J = P_{\\text{atm}}/(R_{\\text{gas}} T_J)$ (with axial temperature cooling along each tube mapped by a WKB impedance taper $\\sqrt{Z_{\\text{vol,out}}/Z_{\\text{vol,in}}}$), **both** mass flow ($\\sum \\dot{m}_i = 0$) and physical acoustic power ($\\sum P_{\\text{ac},i} = 0$) are conserved simultaneously ($< 10^{-15}$).
+
+## 2. Engine-Level First-Law Control-Volume Energy Ledger (Phase 10.1 WP-B)
+\`PhysicalEngine.energyLedger\` integrates the five cylinder control-volume fluxes ($\\int \\dot{H}_{\\text{in}}\\,dt$, $\\int \\dot{H}_{\\text{ex}}\\,dt$, $\\int \\dot{Q}_{\\text{comb}}\\,dt$, $\\int \\dot{Q}_{\\text{wall}}\\,dt$, $\\int P\\,\\dot{V}\\,dt$) and three manifold control-volume fluxes across \`PhysicalEngine.step()\`. Macroscopic state-reconstructed internal energy $\\Delta U(P, V, m)$ matches the net ledger flux to $< 10^{-15}$, and piston boundary work converges monotonically as $O(\\Delta t)$ toward exact analytical slider-crank work $\\sum \\bar{P}\\,\\Delta V_{\\text{exact}}(\\theta)$ and crankshaft mechanical indicated work $\\int \\tau_{\\text{ind,gross}}\\,\\omega\\,dt$ across $24\\,\\text{kHz} \\to 48\\,\\text{kHz} \\to 96\\,\\text{kHz}$.
+
+## 3. Cylinder Initial State & Exact $C^1$-Clamped \`[3/4]\` Rational \`fastTanh\` (Phase 10.1 WP-C / WP-D)
+*   **Cylinder Initial State:** \`Cylinder.constructor\` sets $T_0 = T_{\\text{atm}} + 35.0 = 330.0\\,\\text{K}$ and $P_0 = 38.0\\,\\text{kPa}$ with \`minE = newMass * U_MIN_150\` ($150.0\\,\\text{K}$), eliminating the 342 first-stroke expansion clamps ($T_{\\min} = 165.41\\,\\text{K}$) that occurred against the legacy $220.0\\,\\text{K}$ threshold.
+*   **Exact $C^1$-Clamped \`[3/4]\` Rational \`fastTanh\`:** Maximum absolute error $0.0007217 < 0.00073$ (at $|x| = 2.3487$), a **32.6x error reduction** over the legacy \`[3/2]\` Padé approximation ($0.023520$).
     `,
   }
 ];

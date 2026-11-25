@@ -1,0 +1,39 @@
+name: Phase 10 / 10.1 Physics & Acoustic Validation CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate-and-build:
+    name: Physics Validation, Type-Check & Production Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22 LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Run Phase 10 / 10.1 Physics & Acoustic Validation Suite
+        env:
+          CI: "true"
+        run: npm test
+
+      - name: Run TypeScript type-check (lint)
+        run: npm run lint
+
+      - name: Run Vite production bundle build
+        run: npm run build
